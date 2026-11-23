@@ -138,6 +138,8 @@ public class RlsLoadBalancerTest {
   private final FakeRlsServerImpl fakeRlsServerImpl = new FakeRlsServerImpl(
       fakeClock.getScheduledExecutorService());
   private final Deque<FakeSubchannel> subchannels = new LinkedList<>();
+  private final EquivalentAddressGroup resolvedAddress =
+      new EquivalentAddressGroup(mock(SocketAddress.class));
   private final FakeThrottler fakeThrottler = new FakeThrottler();
   private final String channelTarget = "channelTarget";
   @Captor
@@ -488,6 +490,37 @@ public class RlsLoadBalancerTest {
   }
 
   @Test
+  public void defaultTargetChangesWithSameLookupService() throws Exception {
+    fakeThrottler.nextResult = true;
+    ResolvedAddresses initialAddresses = resolvedAddresses();
+    syncContext.execute(() -> rlsLb.acceptResolvedAddresses(initialAddresses));
+    InOrder inOrder = inOrder(helper);
+    Subchannel oldFallback = subchannels.getLast();
+    assertThat(markReadyAndGetPickResult(inOrder, searchSubchannelArgs).getSubchannel())
+        .isSameInstanceAs(oldFallback);
+    fakeThrottler.nextResult = false;
+
+    defaultTarget = "newDefaultTarget";
+    ResolvedAddresses updatedAddresses = resolvedAddresses();
+    syncContext.execute(() -> rlsLb.acceptResolvedAddresses(updatedAddresses));
+    inOrder.verify(helper).updateBalancingState(eq(ConnectivityState.CONNECTING), any());
+    Subchannel newFallback = subchannels.getLast();
+    assertThat(newFallback).isNotSameInstanceAs(oldFallback);
+    assertThat(markReadyAndGetPickResult(inOrder, searchSubchannelArgs).getSubchannel())
+        .isSameInstanceAs(newFallback);
+    verifyLongCounterAdd("grpc.lb.rls.default_target_picks", 1, 1, "newDefaultTarget", "complete");
+
+    defaultTarget = "";
+    ResolvedAddresses addressesWithoutFallback = resolvedAddresses();
+    syncContext.execute(() -> rlsLb.acceptResolvedAddresses(addressesWithoutFallback));
+    inOrder.verify(helper)
+        .updateBalancingState(eq(ConnectivityState.IDLE), pickerCaptor.capture());
+    assertThat(pickerCaptor.getValue().pickSubchannel(searchSubchannelArgs).getStatus().getCode())
+        .isEqualTo(Code.UNAVAILABLE);
+    verify(helper).createResolvingOobChannelBuilder(anyString(), any(ChannelCredentials.class));
+  }
+
+  @Test
   public void lb_working_withoutDefaultTarget() throws Exception {
     defaultTarget = "";
     deliverResolvedAddresses();
@@ -622,14 +655,18 @@ public class RlsLoadBalancerTest {
   }
 
   private void deliverResolvedAddresses() throws Exception {
+    rlsLb.acceptResolvedAddresses(resolvedAddresses());
+    verify(helper).createResolvingOobChannelBuilder(anyString(), any(ChannelCredentials.class));
+  }
+
+  private ResolvedAddresses resolvedAddresses() throws Exception {
     ConfigOrError parsedConfigOrError =
         provider.parseLoadBalancingPolicyConfig(parseJson(getLbConfigJsonStr()));
     assertThat(parsedConfigOrError.getConfig()).isNotNull();
-    rlsLb.acceptResolvedAddresses(ResolvedAddresses.newBuilder()
-        .setAddresses(ImmutableList.of(new EquivalentAddressGroup(mock(SocketAddress.class))))
+    return ResolvedAddresses.newBuilder()
+        .setAddresses(ImmutableList.of(resolvedAddress))
         .setLoadBalancingPolicyConfig(parsedConfigOrError.getConfig())
-        .build());
-    verify(helper).createResolvingOobChannelBuilder(anyString(), any(ChannelCredentials.class));
+        .build();
   }
 
   @SuppressWarnings("unchecked")

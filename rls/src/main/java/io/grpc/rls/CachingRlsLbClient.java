@@ -23,6 +23,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Converter;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.MoreObjects.ToStringHelper;
+import com.google.common.base.Strings;
 import com.google.common.base.Ticker;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -72,6 +73,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
@@ -129,11 +131,13 @@ final class CachingRlsLbClient {
   private final ManagedChannel rlsChannel;
   private final RouteLookupServiceStub rlsStub;
   private final RlsPicker rlsPicker;
+  private final SubchannelStateManager subchannelStateManager = new SubchannelStateManagerImpl();
   private final ResolvedAddressFactory childLbResolvedAddressFactory;
   @GuardedBy("lock")
   private final RefCountedChildPolicyWrapperFactory refCountedChildPolicyWrapperFactory;
   private final ChannelLogger logger;
-  private final ChildPolicyWrapper fallbackChildPolicyWrapper;
+  @Nullable
+  private volatile ChildPolicyWrapper fallbackChildPolicyWrapper;
 
   static {
     MetricInstrumentRegistry metricInstrumentRegistry
@@ -253,7 +257,7 @@ final class CachingRlsLbClient {
         checkNotNull(builder.resolvedAddressFactory, "resolvedAddressFactory");
     backoffProvider = builder.backoffProvider;
     ChildLoadBalancerHelperProvider childLbHelperProvider =
-        new ChildLoadBalancerHelperProvider(helper, new SubchannelStateManagerImpl(), rlsPicker);
+        new ChildLoadBalancerHelperProvider(helper, subchannelStateManager, rlsPicker);
     refCountedChildPolicyWrapperFactory =
         new RefCountedChildPolicyWrapperFactory(
             lbPolicyConfig.getLoadBalancingPolicy(), childLbResolvedAddressFactory,
@@ -294,11 +298,37 @@ final class CachingRlsLbClient {
     }
   }
 
-  Status acceptResolvedAddressFactory(ResolvedAddressFactory childLbResolvedAddressFactory) {
+  Status acceptResolvedAddressFactory(
+      ResolvedAddressFactory childLbResolvedAddressFactory, @Nullable String defaultTarget) {
     synchronized (lock) {
-      return refCountedChildPolicyWrapperFactory.acceptResolvedAddressFactory(
+      Status status = refCountedChildPolicyWrapperFactory.acceptResolvedAddressFactory(
           childLbResolvedAddressFactory);
+      String newTarget = Strings.emptyToNull(defaultTarget);
+      ChildPolicyWrapper previous = fallbackChildPolicyWrapper;
+      if (!Objects.equals(newTarget, previous == null ? null : previous.getTarget())) {
+        fallbackChildPolicyWrapper = newTarget == null ? null
+            : refCountedChildPolicyWrapperFactory.createOrGet(newTarget);
+        if (previous != null) {
+          boolean retired = refCountedChildPolicyWrapperFactory.release(previous);
+          if (retired || newTarget == null) {
+            // Reprocess picks after any queued shutdown of the old fallback child.
+            helper.getSynchronizationContext().execute(
+                () -> refreshFallbackState(retired ? previous.getTarget() : null));
+          }
+        }
+      }
+      return status;
     }
+  }
+
+  private void refreshFallbackState(@Nullable String retiredTarget) {
+    if (rlsChannel.isShutdown()) {
+      return;
+    }
+    if (retiredTarget != null) {
+      subchannelStateManager.updateState(retiredTarget, ConnectivityState.SHUTDOWN);
+    }
+    helper.updateBalancingState(subchannelStateManager.getAggregatedState(), rlsPicker);
   }
 
   /**
@@ -412,7 +442,10 @@ final class CachingRlsLbClient {
       // TODO(creamsoup) maybe cancel all pending requests
       pendingCallCache.clear();
       rlsChannel.shutdownNow();
-      rlsPicker.close();
+      if (fallbackChildPolicyWrapper != null) {
+        refCountedChildPolicyWrapperFactory.release(fallbackChildPolicyWrapper);
+        fallbackChildPolicyWrapper = null;
+      }
       gaugeRegistration.close();
     }
   }
@@ -1022,8 +1055,6 @@ final class CachingRlsLbClient {
         headers.discardAll(RLS_DATA_KEY);
         headers.put(RLS_DATA_KEY, response.getHeaderData());
       }
-      String defaultTarget = lbPolicyConfig.getRouteLookupConfig().defaultTarget();
-      boolean hasFallback = defaultTarget != null && !defaultTarget.isEmpty();
       if (response.hasData()) {
         ChildPolicyWrapper childPolicyWrapper = response.getChildPolicyWrapper();
         SubchannelPicker picker =
@@ -1048,8 +1079,9 @@ final class CachingRlsLbClient {
         }
         return pickResult;
       } else if (response.hasError()) {
-        if (hasFallback) {
-          return useFallback(args);
+        ChildPolicyWrapper fallback = fallbackChildPolicyWrapper;
+        if (fallback != null) {
+          return useFallback(args, fallback);
         }
         helper.getMetricRecorder().addLongCounter(FAILED_PICKS_COUNTER, 1,
             Arrays.asList(helper.getChannelTarget(), lookupService),
@@ -1066,8 +1098,8 @@ final class CachingRlsLbClient {
     }
 
     /** Uses Subchannel connected to default target. */
-    private PickResult useFallback(PickSubchannelArgs args) {
-      SubchannelPicker picker = fallbackChildPolicyWrapper.getPicker();
+    private PickResult useFallback(PickSubchannelArgs args, ChildPolicyWrapper fallback) {
+      SubchannelPicker picker = fallback.getPicker();
       if (picker == null) {
         return PickResult.withNoResult(
             "connecting", "RLS fallback child policy connecting");
@@ -1076,12 +1108,12 @@ final class CachingRlsLbClient {
       if (pickResult.hasResult()) {
         helper.getMetricRecorder().addLongCounter(DEFAULT_TARGET_PICKS_COUNTER, 1,
             Arrays.asList(helper.getChannelTarget(), lookupService,
-                fallbackChildPolicyWrapper.getTarget(), determineMetricsPickResult(pickResult)),
+                fallback.getTarget(), determineMetricsPickResult(pickResult)),
             Arrays.asList(determineCustomLabel(args)));
       } else if (pickResult.getDelayType() != null) {
         return PickResult.withNoResult(
             pickResult.getDelayType(),
-            "RLS fallback (" + fallbackChildPolicyWrapper.getTarget() + ") delayed: "
+            "RLS fallback (" + fallback.getTarget() + ") delayed: "
                 + pickResult.getDelayReason());
       }
       return pickResult;
@@ -1099,15 +1131,6 @@ final class CachingRlsLbClient {
 
     private String determineCustomLabel(PickSubchannelArgs args) {
       return args.getCallOptions().getOption(Grpc.CALL_OPTION_CUSTOM_LABEL);
-    }
-
-    // GuardedBy CachingRlsLbClient.lock
-    void close() {
-      synchronized (lock) { // Lock is already held, but ErrorProne can't tell
-        if (fallbackChildPolicyWrapper != null) {
-          refCountedChildPolicyWrapperFactory.release(fallbackChildPolicyWrapper);
-        }
-      }
     }
 
     @Override

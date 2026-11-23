@@ -52,6 +52,8 @@ final class RlsLoadBalancer extends LoadBalancer {
     LbPolicyConfiguration lbPolicyConfiguration =
         (LbPolicyConfiguration) resolvedAddresses.getLoadBalancingPolicyConfig();
     checkNotNull(lbPolicyConfiguration, "Missing RLS LB config");
+    ResolvedAddressFactory childAddresses = new ChildLbResolvedAddressFactory(
+        resolvedAddresses.getAddresses(), resolvedAddresses.getAttributes());
     if (!lbPolicyConfiguration.equals(this.lbPolicyConfiguration)) {
       logger.log(ChannelLogLevel.DEBUG, "A new RLS LB config received: {0}", lbPolicyConfiguration);
       boolean needToConnect = this.lbPolicyConfiguration == null
@@ -67,20 +69,16 @@ final class RlsLoadBalancer extends LoadBalancer {
                 .get()
                 .setHelper(helper)
                 .setLbPolicyConfig(lbPolicyConfiguration)
-                .setResolvedAddressesFactory(
-                    new ChildLbResolvedAddressFactory(
-                        resolvedAddresses.getAddresses(), resolvedAddresses.getAttributes()))
+                .setResolvedAddressesFactory(childAddresses)
                 .build();
         logger.log(
             ChannelLogLevel.DEBUG, "LbPolicyConfiguration updated to {0}", lbPolicyConfiguration);
       }
-      // TODO(creamsoup) allow incremental service config update. for initial use case, it is 
-      //  not required.
+      // TODO(creamsoup): Support incremental updates to the remaining service config fields.
       this.lbPolicyConfiguration = lbPolicyConfiguration;
     }
     return routeLookupClient.acceptResolvedAddressFactory(
-        new ChildLbResolvedAddressFactory(
-            resolvedAddresses.getAddresses(), resolvedAddresses.getAttributes()));
+        childAddresses, lbPolicyConfiguration.getRouteLookupConfig().defaultTarget());
   }
 
   @Override

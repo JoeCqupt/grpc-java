@@ -267,7 +267,8 @@ final class LbPolicyConfiguration {
       return retVal;
     }
 
-    void release(ChildPolicyWrapper childPolicyWrapper) {
+    /** Releases a reference and returns whether it was the last one. */
+    boolean release(ChildPolicyWrapper childPolicyWrapper) {
       checkNotNull(childPolicyWrapper, "childPolicyWrapper");
       String target = childPolicyWrapper.getTarget();
       RefCountedChildPolicyWrapper existing = childPolicyMap.get(target);
@@ -275,7 +276,9 @@ final class LbPolicyConfiguration {
       existing.returnObject(childPolicyWrapper);
       if (existing.isReleased()) {
         childPolicyMap.remove(target);
+        return true;
       }
+      return false;
     }
   }
 
